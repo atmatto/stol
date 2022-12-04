@@ -14,6 +14,14 @@
 
 static sg_pass_action pass_action;
 
+// A for loop iterating over the children vector `vec`. Exposes the variable `child` of type **GumboNode.
+#define gumboForEachChild(vec) for (auto child = (GumboNode **)vec.data; child < (GumboNode **)vec.data + vec.length; child++)
+
+// Iterates over the children vector `vec` and sets the variable `ret` of type *GumboNode to point to the first child
+// for which the boolean expression `check` returns true. If no such child exists, this does nothing. The `check` can
+// access a variable named `child`, of type **GumboNode.
+#define gumboFindChild(ret, vec, check) gumboForEachChild(vec) if (check) { ret = *child; break; }
+
 bool gumboElementIdEquals(GumboElement *e, const char *id) {
     auto attribute = gumbo_get_attribute(&e->attributes, "id");
     if (attribute == nullptr) return false;
@@ -26,7 +34,23 @@ bool gumboElementClassEquals(GumboElement *e, const char *cl) {
     return 0 == strcmp(attribute->value, cl);
 }
 
-namespace WiktionaryEn {
+struct HTML {
+    GumboOutput * const output;
+    GumboElement *focus;
+
+    HTML(const HTML&) = delete;
+    HTML(HTML&&) = delete;
+    HTML& operator=(const HTML&) = delete;
+    HTML& operator=(HTML&&) = delete;
+
+    explicit HTML(char *buffer) : output(gumbo_parse(buffer)), focus(nullptr) {}
+
+    ~HTML() {
+        gumbo_destroy_output(&kGumboDefaultOptions, output);
+    }
+};
+
+class WiktionaryProvider {
     // HTML structure:
     // (#mw-content-text > .mw-parser-output)
     //   See also: [.disambig-see-also-2 a]
@@ -38,7 +62,8 @@ namespace WiktionaryEn {
         char query[256] = "";
         bool done = false;
         cpr::AsyncResponse request;
-        std::string data;
+        std::string rawData;
+        HTML *data = nullptr;
 
         void getQueryURL(char *out) const {
             sprintf(out, "https://en.wiktionary.org/wiki/%s", query);
@@ -48,69 +73,62 @@ namespace WiktionaryEn {
             // TODO: Robustness
             if (root->type != GUMBO_NODE_ELEMENT) return nullptr;
             GumboNode *node = root;
-            for (int i = 0; i < node->v.element.children.length; i++) {
-                auto *child = (GumboNode *)node->v.element.children.data[i];
-                if (child->type == GUMBO_NODE_ELEMENT && child->v.element.tag == GUMBO_TAG_BODY) {
-                    node = child;
-                    break;
-                }
-            }
-            for (int i = 0; i < node->v.element.children.length; i++) {
-                auto *child = (GumboNode *)node->v.element.children.data[i];
-                if (child->type == GUMBO_NODE_ELEMENT && gumboElementIdEquals(&child->v.element, "content")) {
-                    node = child;
-                    break;
-                }
-            }
-            for (int i = 0; i < node->v.element.children.length; i++) {
-                auto *child = (GumboNode *)node->v.element.children.data[i];
-                if (child->type == GUMBO_NODE_ELEMENT && gumboElementIdEquals(&child->v.element, "bodyContent")) {
-                    node = child;
-                    break;
-                }
-            }
-            for (int i = 0; i < node->v.element.children.length; i++) {
-                auto *child = (GumboNode *)node->v.element.children.data[i];
-                if (child->type == GUMBO_NODE_ELEMENT && gumboElementIdEquals(&child->v.element, "mw-content-text")) {
-                    node = child;
-                    break;
-                }
-            }
-            for (int i = 0; i < node->v.element.children.length; i++) {
-                auto *child = (GumboNode *)node->v.element.children.data[i];
-                if (child->type == GUMBO_NODE_ELEMENT && gumboElementClassEquals(&child->v.element, "mw-parser-output")) {
-                    node = child;
-                    break;
-                }
-            }
+            gumboFindChild(node, node->v.element.children, (*child)->type == GUMBO_NODE_ELEMENT && (*child)->v.element.tag == GUMBO_TAG_BODY)
+            gumboFindChild(node, node->v.element.children, (*child)->type == GUMBO_NODE_ELEMENT && gumboElementIdEquals(&(*child)->v.element, "content"))
+            gumboFindChild(node, node->v.element.children, (*child)->type == GUMBO_NODE_ELEMENT && gumboElementIdEquals(&(*child)->v.element, "bodyContent"))
+            gumboFindChild(node, node->v.element.children, (*child)->type == GUMBO_NODE_ELEMENT && gumboElementIdEquals(&(*child)->v.element, "mw-content-text"))
+            gumboFindChild(node, node->v.element.children, (*child)->type == GUMBO_NODE_ELEMENT && gumboElementClassEquals(&(*child)->v.element, "mw-parser-output"))
             if (node->type != GUMBO_NODE_ELEMENT || !gumboElementClassEquals(&node->v.element, "mw-parser-output")) return nullptr;
             return &node->v.element;
         }
 
         void processResult() {
-            GumboOutput *output = gumbo_parse(data.data());
-            auto content = findContent(output->root);
-            if (content != nullptr) {
-                data = data.substr(content->start_pos.offset + content->original_tag.length, content->end_pos.offset - content->start_pos.offset - content->original_tag.length);
-            } else {
-                data = "Could not retrieve content.";
-            }
-            gumbo_destroy_output(&kGumboDefaultOptions, output);
+            data = new HTML(rawData.data());
+            data->focus = findContent(data->output->root);
         }
+
+        static void displayRecursive(GumboNode *node) {
+            // TODO: What about GUMBO_NODE_WHITESPACE?
+            if (node->type == GUMBO_NODE_TEXT && node->v.text.text != nullptr) {
+                ImGui::TextUnformatted(node->v.text.text);
+            } else if (node->type == GUMBO_NODE_ELEMENT) {
+                auto element = node->v.element;
+                switch (element.tag) {
+                default:
+                    gumboForEachChild(element.children) {
+                        displayRecursive(*child);
+                    }
+                }
+            }
+        }
+
     public:
         void DisplayAsTabItem() {
             if (!done) {
                 if (request.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
                     auto r = request.get();
-                    data = r.text;
+                    rawData = r.text;
                     done = true;
                     processResult();
+                } else {
+                    return;
                 }
             }
+            assert(data != nullptr);
 
             if (ImGui::BeginTabItem(query)) { // TODO: Handle the case when there are multiple equal queries.
                 // TODO: alternative search results dropdown
-                ImGui::TextUnformatted(data.data(), data.end().base());
+                auto content = data->focus;
+                if (content != nullptr) {
+//                    for (int i = 0; i < content->children.length; i++) {
+//                        displayRecursive((GumboNode *) content->children.data[i]);
+//                    }
+                    gumboForEachChild(content->children) {
+                        displayRecursive(*child);
+                    }
+                } else {
+                    ImGui::TextUnformatted("Could not retrieve content.");
+                }
                 ImGui::EndTabItem();
             }
 
@@ -125,32 +143,30 @@ namespace WiktionaryEn {
         }
     };
 
-    class Client {
-        char input[256] = "";
-        std::vector<Query> queries; // TODO: Maybe use list?
+    char input[256] = "";
+    std::vector<Query> queries; // TODO: Maybe use list?
 
-    public:
-        void Display() {
-            ImGui::SetNextWindowSize(ImVec2(300, 600), ImGuiCond_Appearing);
-            ImGui::Begin("Wiktionary");
-            // Search field
-            ImGui::InputText("##Word", input, 256); // TODO: Handle enter key.
-            ImGui::SameLine();
-            if (ImGui::Button("Look up")) {
-                queries.emplace_back(input);
-            }
-            // Results
-            ImGui::BeginTabBar("Results");
-            for (auto &query : queries) {
-                query.DisplayAsTabItem();
-            }
-            ImGui::EndTabBar();
-            ImGui::End();
+public:
+    void Display() {
+        ImGui::SetNextWindowSize(ImVec2(300, 600), ImGuiCond_Appearing);
+        ImGui::Begin("Wiktionary");
+        // Search field
+        ImGui::InputText("##Word", input, 256); // TODO: Handle enter key.
+        ImGui::SameLine();
+        if (ImGui::Button("Look up")) {
+            queries.emplace_back(input);
         }
-    };
-}
+        // Results
+        ImGui::BeginTabBar("Results");
+        for (auto &query : queries) {
+            query.DisplayAsTabItem();
+        }
+        ImGui::EndTabBar();
+        ImGui::End();
+    }
+};
 
-static WiktionaryEn::Client wiktionary;
+static WiktionaryProvider wiktionary;
 
 void init() {
 	sg_desc desc = { };
