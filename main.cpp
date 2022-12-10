@@ -6,6 +6,7 @@
 #include "cpr/cpr.h"
 #include "gumbo/gumbo.h"
 
+// TODO: Update Dear ImGui to v1.89.2 (https://github.com/ocornut/imgui/commit/bd96f6eac4ad544efb265d7e6bcdb30f99a841c4)
 #include "imgui/imgui.h"
 #include "sokol/sokol_app.h"
 #include "sokol/sokol_gfx.h"
@@ -13,6 +14,9 @@
 #include "sokol/sokol_imgui.h"
 
 static sg_pass_action pass_action;
+
+const char *fallbackText = "(Error getting text)";
+#define safeCharPtr(ptr) (((ptr) == nullptr) ? fallbackText : (ptr))
 
 // A for loop iterating over the children vector `vec`. Exposes the variable `child` of type **GumboNode.
 #define gumboForEachChild(vec) for (auto child = (GumboNode **)vec.data; child < (GumboNode **)vec.data + vec.length; child++)
@@ -32,6 +36,15 @@ bool gumboElementClassEquals(GumboElement *e, const char *cl) {
     auto attribute = gumbo_get_attribute(&e->attributes, "class");
     if (attribute == nullptr) return false;
     return 0 == strcmp(attribute->value, cl);
+}
+
+// Adds underline to previously drawn text. Created by Doug Binks, source:
+// https://mastodon.gamedev.place/@dougbinks/99009293355650878
+void AddUnderline(ImColor color) {
+    ImVec2 min = ImGui::GetItemRectMin();
+    ImVec2 max = ImGui::GetItemRectMax();
+    min.y = max.y;
+    ImGui::GetWindowDrawList()->AddLine(min, max, color);
 }
 
 struct HTML {
@@ -87,17 +100,221 @@ class WiktionaryProvider {
             data->focus = findContent(data->output->root);
         }
 
+        static const char *getHeaderText(GumboElement *element) {
+            GumboNode *node;
+            gumboFindChild(node, element->children, (*child)->type == GUMBO_NODE_ELEMENT && gumboElementClassEquals(&(*child)->v.element, "mw-headline"))
+            if (node->type == GUMBO_NODE_ELEMENT && node->v.element.children.length >= 1) {
+                node = (GumboNode *)node->v.element.children.data[0];
+                if (node->type == GUMBO_NODE_TEXT) {
+                    return node->v.text.text;
+                } else {
+                    // Couldn't find the text.
+                    return nullptr;
+                }
+            }
+        }
+
+        // If true, then the header is open.
+        static bool displayLanguageHeader(GumboNode *node) {
+            assert(node->type == GUMBO_NODE_ELEMENT);
+            const char *text = getHeaderText(&node->v.element);
+            if (text == nullptr) {
+                ImGui::Separator();
+                return true;
+            } else {
+                return ImGui::CollapsingHeader(text);
+            }
+        }
+
+        // Display the node and its children as plain text.
+        static void displayText(GumboNode *node, std::string &text) {
+            if (node->type == GUMBO_NODE_TEXT && node->v.text.text != nullptr) {
+                text += node->v.text.text;
+            } else if (node->type == GUMBO_NODE_WHITESPACE) {
+                text += " ";
+            } else if (node->type == GUMBO_NODE_ELEMENT) {
+                auto &element = node->v.element;
+                gumboForEachChild(element.children) {
+                    if ((*child)->type != GUMBO_NODE_ELEMENT) {
+                        displayText(*child, text);
+                        continue;
+                    }
+                    auto childElement = (*child)->v.element;
+                    if (gumboElementClassEquals(&childElement, "audiotable")) continue;
+                    switch (childElement.tag) {
+                        // ignore
+                        case GUMBO_TAG_STYLE:
+                            break;
+                        // inline
+                        case GUMBO_TAG_SPAN:
+                        case GUMBO_TAG_I:
+                        case GUMBO_TAG_A:
+                        case GUMBO_TAG_B:
+                        case GUMBO_TAG_EM:
+                        case GUMBO_TAG_U:
+                        case GUMBO_TAG_STRONG:
+                        case GUMBO_TAG_SUB:
+                        case GUMBO_TAG_SUP:
+                        case GUMBO_TAG_ABBR:
+                            displayText(*child, text);
+                            break;
+                        // block
+                        default:
+                            if (!text.empty() && text[text.length() - 1] != '\n') {
+                                text += '\n';
+                            }
+                            displayText(*child, text);
+                            break;
+                    }
+                }
+            }
+        }
+
+        static void displayList(GumboElement *element, bool ordered = false) {
+            int counter = 0;
+            gumboForEachChild(element->children) {
+                std::string text;
+                if ((*child)->type == GUMBO_NODE_ELEMENT) {
+                    switch ((*child)->v.element.tag) {
+                        case GUMBO_TAG_LI:
+                        case GUMBO_TAG_DD:
+                        case GUMBO_TAG_DT:
+                            if (gumboElementClassEquals(&(*child)->v.element, "mw-empty-elt")) continue;
+                            displayText((*child), text);
+                            if (text.empty()) continue;
+                            counter++;
+                            if (ordered) {
+                                ImGui::Text("%d.", counter);
+                                ImGui::SameLine(0, 0);
+                                ImGui::TextWrapped("%s", text.data());
+                            } else {
+                                ImGui::Bullet();
+                                ImGui::TextWrapped("%s", text.data());
+                            }
+                            break;
+                        default:
+                            displayText((*child), text);
+                            ImGui::TextWrapped("%s", text.data());
+                    }
+                }
+            }
+        }
+
+        static void displayDefinition(GumboElement *item) {
+            std::string text;
+            gumboForEachChild(item->children) {
+                if ((*child)->type == GUMBO_NODE_TEXT) {
+                    text += (*child)->v.text.text;
+                } else if ((*child)->type == GUMBO_NODE_WHITESPACE) {
+                    text += ' ';
+                } else if ((*child)->type == GUMBO_NODE_ELEMENT) {
+                    auto &element = (*child)->v.element;
+                    switch (element.tag) {
+                        // ignore
+                        case GUMBO_TAG_STYLE:
+                            break;
+                        // special
+                        case GUMBO_TAG_DL:
+                        case GUMBO_TAG_UL: // TODO: If only quotations are in unordered lists, then make them collapsed by default.
+                            for (auto &c : text) {
+                                if (c != ' ' && c != '\n') {
+                                    ImGui::TextWrapped("%s", text.data());
+                                    text.clear();
+                                    break;
+                                }
+                            }
+                            ImGui::Indent(10);
+                            displayList(&element);
+                            ImGui::Unindent(10);
+                            break;
+                        // inline
+                        case GUMBO_TAG_SPAN:
+                        case GUMBO_TAG_I:
+                        case GUMBO_TAG_A:
+                        case GUMBO_TAG_B:
+                        case GUMBO_TAG_EM:
+                        case GUMBO_TAG_U:
+                        case GUMBO_TAG_STRONG:
+                        case GUMBO_TAG_SUB:
+                        case GUMBO_TAG_SUP:
+                        case GUMBO_TAG_ABBR:
+                            displayText(*child, text);
+                            break;
+                        // block
+                        default:
+                            if (!text.empty() && text[text.length() - 1] != '\n') text += '\n';
+                            displayText(*child, text);
+                            break;
+                    }
+                }
+            }
+            if (!text.empty()) {
+                ImGui::TextWrapped("%s", text.data());
+            }
+        }
+
+        static void displayDefinitions(GumboElement *list) {
+            int counter = 0;
+            gumboForEachChild(list->children) {
+                std::string text;
+                if ((*child)->type == GUMBO_NODE_ELEMENT) {
+                    if ((*child)->v.element.tag == GUMBO_TAG_LI) {
+                        if (gumboElementClassEquals(&(*child)->v.element, "mw-empty-elt")) continue;
+                        displayText((*child), text);
+                        if (text.empty()) continue;
+                        counter++;
+                        ImGui::Text("%d.", counter);
+                        ImGui::SameLine(0, 0);
+                        displayDefinition(&(*child)->v.element);
+                    } else {
+                        displayText((*child), text);
+                        ImGui::TextWrapped(".%s", text.data());
+                    }
+                }
+            }
+        }
+
         static void displayRecursive(GumboNode *node) {
             // TODO: What about GUMBO_NODE_WHITESPACE?
             if (node->type == GUMBO_NODE_TEXT && node->v.text.text != nullptr) {
                 ImGui::TextUnformatted(node->v.text.text);
             } else if (node->type == GUMBO_NODE_ELEMENT) {
-                auto element = node->v.element;
+                auto &element = node->v.element;
+                std::string text;
                 switch (element.tag) {
-                default:
-                    gumboForEachChild(element.children) {
-                        displayRecursive(*child);
-                    }
+                    case GUMBO_TAG_STYLE:
+                    case GUMBO_TAG_DIV: // TODO: Should there be any exceptions to this?
+                        break;
+                    case GUMBO_TAG_H3:
+                        ImGui::Dummy(ImVec2(0.0f, 0.5f * ImGui::GetTextLineHeightWithSpacing()));
+                        ImGui::Separator();
+                        ImGui::TextUnformatted(safeCharPtr(getHeaderText(&element)));
+                        AddUnderline(ImGui::GetStyleColorVec4(ImGuiCol_Text));
+                        break;
+                    case GUMBO_TAG_H4:
+                    case GUMBO_TAG_H5:
+                    case GUMBO_TAG_H6:
+                        ImGui::Dummy(ImVec2(0.0f, 0.5f * ImGui::GetTextLineHeightWithSpacing()));
+                        ImGui::TextUnformatted(safeCharPtr(getHeaderText(&element)));
+                        AddUnderline(ImGui::GetStyleColorVec4(ImGuiCol_Text));
+                        break;
+                    case GUMBO_TAG_P:
+                        displayText(node, text);
+                        ImGui::TextWrapped("%s", text.data());
+                        break;
+                    case GUMBO_TAG_UL:
+                        displayList(&element);
+                        break;
+                    case GUMBO_TAG_OL: // I hope that ordered lists always contain definitions...
+                        displayDefinitions(&element);
+                        break;
+                    case GUMBO_TAG_HR:
+                        break;
+                    default:
+                        gumboForEachChild(element.children) {
+                            displayRecursive(*child);
+                        }
+                        break;
                 }
             }
         }
@@ -120,11 +337,13 @@ class WiktionaryProvider {
                 // TODO: alternative search results dropdown
                 auto content = data->focus;
                 if (content != nullptr) {
-//                    for (int i = 0; i < content->children.length; i++) {
-//                        displayRecursive((GumboNode *) content->children.data[i]);
-//                    }
+                    bool show = true;
                     gumboForEachChild(content->children) {
-                        displayRecursive(*child);
+                        if ((*child)->type == GUMBO_NODE_ELEMENT && (*child)->v.element.tag == GUMBO_TAG_H2) {
+                            show = displayLanguageHeader(*child);
+                        } else if (show) {
+                            displayRecursive(*child);
+                        }
                     }
                 } else {
                     ImGui::TextUnformatted("Could not retrieve content.");
