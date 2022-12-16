@@ -274,6 +274,104 @@ class WiktionaryProvider {
             }
         }
 
+        // Returns the amount of columns occupied by the table cell.
+        static int getTableCellWidth(GumboElement *cell) {
+            auto colspan = gumbo_get_attribute(&cell->attributes, "colspan");
+            if (colspan == nullptr) {
+                return 1;
+            } else {
+                int columns = 1;
+                sscanf(colspan->value, "%d", &columns);
+                return columns;
+            }
+        }
+
+        // Returns the amount of rows occupied by the table cell.
+        static int getTableCellHeight(GumboElement *cell) {
+            auto rowspan = gumbo_get_attribute(&cell->attributes, "rowspan");
+            if (rowspan == nullptr) {
+                return 1;
+            } else {
+                int columns = 1;
+                sscanf(rowspan->value, "%d", &columns);
+                return columns;
+            }
+        }
+
+        static void displayTableRow(GumboElement *tr, int columns, std::vector<int> &rowspans) {
+            if (gumboElementClassEquals(tr, "vsShow")) {
+                // These rows are displayed when the table is collapsed.
+                return;
+            }
+            int column = 0, width;
+            ImGui::TableNextRow();
+            gumboForEachChild(tr->children) {
+                if ((*child)->type == GUMBO_NODE_ELEMENT && ((*child)->v.element.tag == GUMBO_TAG_TH || (*child)->v.element.tag == GUMBO_TAG_TD)) {
+                    if (column >= columns) goto endRow;
+                    while (rowspans[column] > 0) {
+                        rowspans[column]--;
+                        column++;
+                        if (column >= columns) goto endRow;
+                    }
+                    GumboElement *cell = &(*child)->v.element;
+                    std::string text;
+                    displayText((*child), text);
+                    width = getTableCellWidth(cell);
+                    ImGui::TableSetColumnIndex(column);
+                    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + (float)width * ImGui::GetColumnWidth());
+                    ImGui::TextWrapped("%s", text.data());
+                    ImGui::PopTextWrapPos();
+                    for (int i = 0; i < width; i++) {
+                        rowspans[column + i] = getTableCellHeight(cell) - 1;
+                    }
+                    column += width;
+                }
+            }
+        endRow:
+            for (int i = column; i < columns; i++) {
+                rowspans[i]--;
+            }
+        }
+
+        // Returns the number of columns. If it can't be retrieved, the function returns a negative value.
+        // It may also return 0.
+        static int getTableWidth(GumboElement *tbody) {
+            GumboElement *firstRow;
+            gumboForEachChild(tbody->children) {
+                if ((*child)->type == GUMBO_NODE_ELEMENT && (*child)->v.element.tag == GUMBO_TAG_TR) {
+                    firstRow = &(*child)->v.element;
+                    break;
+                }
+            }
+            if (firstRow == nullptr) return -1;
+            int columns = 0;
+            gumboForEachChild(firstRow->children) {
+                if ((*child)->type == GUMBO_NODE_ELEMENT && ((*child)->v.element.tag == GUMBO_TAG_TH || (*child)->v.element.tag == GUMBO_TAG_TD)) {
+                    columns += getTableCellWidth(&(*child)->v.element);
+                }
+            }
+            return columns;
+        }
+
+        static void displayTable(GumboElement *tbody) {
+            ImGui::PushID(tbody);
+            int columns = getTableWidth(tbody);
+            if (columns <= 0) {
+                ImGui::TextUnformatted("(Invalid table)");
+            } else {
+                if (ImGui::BeginTable("Table", columns, ImGuiTableFlags_NoClip|ImGuiTableFlags_BordersOuter|ImGuiTableFlags_RowBg)) {
+                    std::vector<int> rowspans(columns, 0); // rowspans[i] = x means to skip the ith column in next x rows.
+                    gumboForEachChild(tbody->children) {
+                        if ((*child)->type == GUMBO_NODE_ELEMENT && (*child)->v.element.tag == GUMBO_TAG_TR) {
+                            displayTableRow(&(*child)->v.element, columns, rowspans);
+                        }
+                    }
+                    ImGui::EndTable();
+                }
+            }
+            ImGui::PopID();
+        }
+
         static void displayRecursive(GumboNode *node) {
             // TODO: What about GUMBO_NODE_WHITESPACE?
             if (node->type == GUMBO_NODE_TEXT && node->v.text.text != nullptr) {
@@ -281,6 +379,7 @@ class WiktionaryProvider {
             } else if (node->type == GUMBO_NODE_ELEMENT) {
                 auto &element = node->v.element;
                 std::string text;
+                // TDOO: div.list-switcher (multi-column ul)
                 switch (element.tag) {
                     case GUMBO_TAG_STYLE:
                     case GUMBO_TAG_DIV: // TODO: Should there be any exceptions to this?
@@ -309,6 +408,9 @@ class WiktionaryProvider {
                         displayDefinitions(&element);
                         break;
                     case GUMBO_TAG_HR:
+                        break;
+                    case GUMBO_TAG_TBODY:
+                        displayTable(&element);
                         break;
                     default:
                         gumboForEachChild(element.children) {
