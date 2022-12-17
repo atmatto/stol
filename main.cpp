@@ -495,12 +495,43 @@ void init() {
 	sg_setup(&desc);
 
 	simgui_desc_t simgui_desc = { };
-	simgui_setup(&simgui_desc);
+    simgui_desc.no_default_font = true;
+    simgui_setup(&simgui_desc);
 
-	ImGuiIO& io = ImGui::GetIO();
+	auto& io = ImGui::GetIO();
 	io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
 
-	pass_action.colors[0].action = SG_ACTION_CLEAR;
+    ImFontConfig fontCfg;
+    fontCfg.FontDataOwnedByAtlas = false;
+    fontCfg.OversampleH = 2;
+    fontCfg.OversampleV = 2;
+    fontCfg.RasterizerMultiply = 1.5f;
+
+    static const ImWchar ranges[] = { // TODO: Maybe detect dynamically from text.
+        0x0020, 0xFFFF,
+        0
+    };
+    // TODO: Load from memory
+    io.Fonts->AddFontFromFileTTF("fonts/NotoSans/NotoSansMono-Regular.ttf", 16.0f, &fontCfg, &ranges[0]);
+    fontCfg.MergeMode = true;
+    io.Fonts->AddFontFromFileTTF("fonts/DejaVuSans/DejaVuSans.ttf", 16.0f, &fontCfg, &ranges[0]); // fallback
+
+    unsigned char* font_pixels;
+    int font_width, font_height;
+    io.Fonts->GetTexDataAsRGBA32(&font_pixels, &font_width, &font_height);
+    sg_image_desc img_desc = { };
+    img_desc.width = font_width;
+    img_desc.height = font_height;
+    img_desc.pixel_format = SG_PIXELFORMAT_RGBA8;
+    img_desc.wrap_u = SG_WRAP_CLAMP_TO_EDGE;
+    img_desc.wrap_v = SG_WRAP_CLAMP_TO_EDGE;
+    img_desc.min_filter = SG_FILTER_LINEAR;
+    img_desc.mag_filter = SG_FILTER_LINEAR;
+    img_desc.data.subimage[0][0].ptr = font_pixels;
+    img_desc.data.subimage[0][0].size = font_width * font_height * 4;
+    io.Fonts->TexID = (ImTextureID)(uintptr_t) sg_make_image(&img_desc).id;
+
+    pass_action.colors[0].action = SG_ACTION_CLEAR;
 	pass_action.colors[0].value = { 0.9f, 0.9f, 0.9f, 1.0f };
 }
 
